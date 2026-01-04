@@ -41,19 +41,24 @@ Follow this order:
    - OpenAPI/Swagger spec if found
    - Source scan heuristics
    - Route listing files if found
-6) Infer how to start the backend locally:
+6) Read models/DTOs/schemas to infer request/response shapes:
+   - Prefer explicit schema sources (OpenAPI, JSON Schema, Prisma, ORM models)
+   - Fall back to DTO/model classes and validators to derive payloads
+7) Infer how to start the backend locally:
    - Prefer existing scripts (`package.json` scripts, `Makefile`, `docker-compose.yml`, `Dockerfile`)
    - Record a start command + expected port/health endpoint
-7) Start the backend in the background before any API calls:
+8) Start the backend in the background before any API calls:
    - Use the inferred start command
    - Wait for health/ready endpoint or port open with a timeout
    - Capture PID/logs and stop the process on completion or failure
-8) Infer a safe call order:
+9) Connect to the DB (when available) using extracted credentials and local DB CLIs:
+   - Use psql/mysql/sqlite3/mongosh to inspect schema or seed data
+10) Infer a safe call order:
    - Health endpoints first
    - Auth/login next if detected
    - Create -> Read -> Update -> Delete (Delete disabled unless enabled)
-9) Generate a test runner script (Python/Node/Bash based on runtime availability).
-10) Optionally execute and write reports/artifacts.
+11) Generate a test runner script (Python/Node/Bash based on runtime availability).
+12) Optionally execute and write reports/artifacts.
 
 ## Configuration
 
@@ -89,6 +94,7 @@ Supported keys (all optional):
 - `reports/api-test-report.md`
 - `reports/api-test-report.json`
 - `artifacts/` request/response dumps
+- `artifacts/requests/` per-request payloads, headers, and timings for debugging
 
 ## Troubleshooting
 
@@ -105,6 +111,7 @@ Supported keys (all optional):
 - Ask before enabling DELETE endpoints.
 - If DB seeding is requested but DB CLI is missing, ask the user to install the CLI or provide a seed file.
 - If running tests, try to start the backend in the background first; only skip if a running base URL is already confirmed or the user says it's handled.
+- When DTOs/models indicate required fields, prefer them over guessed payloads; ask if required fields or enums are unclear.
 
 ## Examples
 
