@@ -41,12 +41,19 @@ Follow this order:
    - OpenAPI/Swagger spec if found
    - Source scan heuristics
    - Route listing files if found
-6) Infer a safe call order:
+6) Infer how to start the backend locally:
+   - Prefer existing scripts (`package.json` scripts, `Makefile`, `docker-compose.yml`, `Dockerfile`)
+   - Record a start command + expected port/health endpoint
+7) Start the backend in the background before any API calls:
+   - Use the inferred start command
+   - Wait for health/ready endpoint or port open with a timeout
+   - Capture PID/logs and stop the process on completion or failure
+8) Infer a safe call order:
    - Health endpoints first
    - Auth/login next if detected
    - Create -> Read -> Update -> Delete (Delete disabled unless enabled)
-7) Generate a test runner script (Python/Node/Bash based on runtime availability).
-8) Optionally execute and write reports/artifacts.
+9) Generate a test runner script (Python/Node/Bash based on runtime availability).
+10) Optionally execute and write reports/artifacts.
 
 ## Configuration
 
@@ -97,6 +104,7 @@ Supported keys (all optional):
 - Ask for credentials if auth endpoints are detected but no credentials are provided.
 - Ask before enabling DELETE endpoints.
 - If DB seeding is requested but DB CLI is missing, ask the user to install the CLI or provide a seed file.
+- If running tests, try to start the backend in the background first; only skip if a running base URL is already confirmed or the user says it's handled.
 
 ## Examples
 
