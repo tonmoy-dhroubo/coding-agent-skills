@@ -1,0 +1,18 @@
+{
+  "baseUrl": "http://localhost:8080",
+  "auth": {
+    "type": "bearer",
+    "loginEndpoint": "/auth/login",
+    "username": "demo@example.com",
+    "password": "redacted",
+    "tokenPath": "token"
+  },
+  "headers": {
+    "X-Trace": "api-test"
+  },
+  "include": ["/health", "/users", "/posts"],
+  "exclude": ["/admin"],
+  "allowDelete": false,
+  "timeoutSeconds": 10,
+  "retries": 1
+}

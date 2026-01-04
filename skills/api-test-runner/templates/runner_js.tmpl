@@ -1,0 +1,271 @@
+#!/usr/bin/env node
+const fs = require("fs");
+const path = require("path");
+const { spawnSync } = require("child_process");
+
+const payload = {{PAYLOAD_JSON}};
+const plan = payload.plan || [];
+const config = payload.config || {};
+const reportPath = payload.report_path;
+const artifactsDir = payload.artifacts_dir;
+
+const baseUrl = config.baseUrl || "http://localhost:8080";
+const headers = Object.assign({ Accept: "application/json" }, config.headers || {});
+const retries = Number(config.retries || 1);
+const timeoutSeconds = Number(config.timeoutSeconds || 10);
+const allowDelete = Boolean(config.allowDelete);
+const context = {};
+const db = config.db || {};
+const dbClis = config.dbClis || {};
+
+function redactHeaders(raw) {
+  const out = Object.assign({}, raw);
+  if (out.Authorization) out.Authorization = "Bearer ***";
+  return out;
+}
+
+function sanitizeFilename(text) {
+  return text.replace(/[^a-zA-Z0-9-_.]/g, "_");
+}
+
+async function request(method, url, body) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutSeconds * 1000);
+  const reqHeaders = Object.assign({}, headers);
+  let fetchBody = undefined;
+  if (body !== undefined && body !== null) {
+    reqHeaders["Content-Type"] = "application/json";
+    fetchBody = JSON.stringify(body);
+  }
+  const start = Date.now();
+  try {
+    const resp = await fetch(url, { method, headers: reqHeaders, body: fetchBody, signal: controller.signal });
+    const text = await resp.text();
+    const latencyMs = Date.now() - start;
+    clearTimeout(timeout);
+    return { status: resp.status, latencyMs, text, reqHeaders };
+  } catch (err) {
+    clearTimeout(timeout);
+    return { status: 0, latencyMs: Date.now() - start, text: String(err), reqHeaders };
+  }
+}
+
+async function maybeAuth() {
+  const auth = config.auth || {};
+  if (!auth.loginEndpoint) return;
+  let payload = auth.payload;
+  if (!payload) {
+    const username = auth.username || "";
+    const password = auth.password || "";
+    payload = username || password ? { username, password } : {};
+  }
+  const url = baseUrl.replace(/\/$/, "") + auth.loginEndpoint;
+  const res = await request("POST", url, payload);
+  if (res.status && res.text) {
+    try {
+      const data = JSON.parse(res.text);
+      const tokenPath = auth.tokenPath || "token";
+      const token = data[tokenPath];
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+        context.auth_token = token;
+      }
+    } catch (_) {}
+  }
+}
+
+function runSeed() {
+  const seedSql = config.seedSql;
+  const seedFile = config.seedFile;
+  if (!seedSql && !seedFile) return;
+
+  const engine = db.engine || db.db_engine || db.type || "unknown";
+  let cli = null;
+  let args = [];
+  if (engine === "postgres" && dbClis.psql) {
+    cli = dbClis.psql;
+    args = [
+      "-h",
+      String(db.host || "localhost"),
+      "-p",
+      String(db.port || 5432),
+      "-U",
+      String(db.user || "postgres"),
+      "-d",
+      String(db.database || "postgres"),
+    ];
+    if (seedFile) args = args.concat(["-f", seedFile]);
+    else args = args.concat(["-c", seedSql]);
+  } else if (engine === "mysql" && dbClis.mysql) {
+    cli = dbClis.mysql;
+    args = [
+      "-h",
+      String(db.host || "localhost"),
+      "-P",
+      String(db.port || 3306),
+      "-u",
+      String(db.user || "root"),
+      String(db.database || "mysql"),
+    ];
+    if (db.password) args.splice(3, 0, `-p${db.password}`);
+    if (seedFile) args = args.concat(["-e", `source ${seedFile}`]);
+    else args = args.concat(["-e", seedSql]);
+  } else if (engine === "sqlite" && dbClis.sqlite3) {
+    cli = dbClis.sqlite3;
+    const dbPath = db.database || db.path || "db.sqlite";
+    args = [dbPath, seedFile ? `.read ${seedFile}` : seedSql];
+  }
+
+  if (!cli || !args.length) {
+    console.log("DB seed skipped: no matching DB CLI found.");
+    return;
+  }
+
+  console.log(`Running DB seed using ${path.basename(cli)}`);
+  spawnSync(cli, args, { stdio: "inherit" });
+}
+
+function runInspect() {
+  if (!config.inspectDb) return;
+  const engine = db.engine || db.db_engine || db.type || "unknown";
+  let cli = null;
+  let args = [];
+  const outputPath = path.join(artifactsDir, "db-inspect.txt");
+  if (engine === "postgres" && dbClis.psql) {
+    cli = dbClis.psql;
+    args = [
+      "-h",
+      String(db.host || "localhost"),
+      "-p",
+      String(db.port || 5432),
+      "-U",
+      String(db.user || "postgres"),
+      "-d",
+      String(db.database || "postgres"),
+      "-c",
+      "\\\\dt",
+    ];
+  } else if (engine === "mysql" && dbClis.mysql) {
+    cli = dbClis.mysql;
+    args = [
+      "-h",
+      String(db.host || "localhost"),
+      "-P",
+      String(db.port || 3306),
+      "-u",
+      String(db.user || "root"),
+      String(db.database || "mysql"),
+      "-e",
+      "SHOW TABLES;",
+    ];
+    if (db.password) args.splice(3, 0, `-p${db.password}`);
+  } else if (engine === "sqlite" && dbClis.sqlite3) {
+    cli = dbClis.sqlite3;
+    const dbPath = db.database || db.path || "db.sqlite";
+    args = [dbPath, ".tables"];
+  }
+
+  if (!cli || !args.length) {
+    console.log("DB inspect skipped: no matching DB CLI found.");
+    return;
+  }
+
+  console.log(`Inspecting DB using ${path.basename(cli)}`);
+  fs.mkdirSync(artifactsDir, { recursive: true });
+  const result = spawnSync(cli, args, { encoding: "utf-8" });
+  fs.writeFileSync(outputPath, result.stdout + result.stderr);
+}
+
+function substitutePath(pathValue) {
+  let out = pathValue;
+  Object.keys(context).forEach((key) => {
+    out = out.replace(`{${key}}`, String(context[key]));
+    out = out.replace(`:${key}`, String(context[key]));
+  });
+  return out;
+}
+
+function captureContext(text) {
+  try {
+    const data = JSON.parse(text);
+    if (data && typeof data === "object") {
+      Object.keys(data).forEach((key) => {
+        if (key.toLowerCase().endsWith("id") || key === "id") {
+          context[key] = data[key];
+        }
+      });
+    }
+  } catch (_) {}
+}
+
+function writeArtifact(index, method, pathValue, status, latencyMs, reqHeaders, body) {
+  fs.mkdirSync(artifactsDir, { recursive: true });
+  const filename = sanitizeFilename(`${String(index).padStart(2, "0")}_${method}_${pathValue.replace(/^\//, "") || "root"}`);
+  const artifactPath = path.join(artifactsDir, `${filename}.json`);
+  fs.writeFileSync(
+    artifactPath,
+    JSON.stringify(
+      {
+        method,
+        path: pathValue,
+        status,
+        latency_ms: latencyMs,
+        request_headers: redactHeaders(reqHeaders),
+        response: body,
+      },
+      null,
+      2
+    )
+  );
+}
+
+function writeReports(results) {
+  const mdLines = [
+    "# API Test Report",
+    "",
+    "| Method | Path | Status | Latency (ms) | Notes |",
+    "| --- | --- | --- | --- | --- |",
+  ];
+  results.forEach((item) => {
+    mdLines.push(`| ${item.method} | ${item.path} | ${item.status} | ${item.latency_ms} | ${item.notes} |`);
+  });
+  fs.mkdirSync(path.dirname(reportPath), { recursive: true });
+  fs.writeFileSync(reportPath, mdLines.join("\n") + "\n");
+  fs.writeFileSync(reportPath.replace(/\.md$/, ".json"), JSON.stringify({ results }, null, 2));
+}
+
+async function main() {
+  const results = [];
+  runSeed();
+  runInspect();
+  await maybeAuth();
+  for (let i = 0; i < plan.length; i++) {
+    const ep = plan[i];
+    const method = ep.method || "GET";
+    if (method === "DELETE" && !allowDelete) continue;
+    const rawPath = ep.path || "/";
+    const pathValue = substitutePath(rawPath);
+    const url = baseUrl.replace(/\/$/, "") + pathValue;
+    const payload = ["POST", "PUT", "PATCH"].includes(method) ? ep.payload : undefined;
+
+    let res = { status: 0, latencyMs: 0, text: "", reqHeaders: {} };
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      res = await request(method, url, payload);
+      if (res.status && res.status < 500) break;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+
+    captureContext(res.text);
+    let notes = res.status && res.status < 400 ? "ok" : "error";
+    if (ep.payload_guess) notes += "; payload guessed";
+
+    writeArtifact(i + 1, method, pathValue, res.status, res.latencyMs, res.reqHeaders, res.text);
+    results.push({ method, path: pathValue, status: res.status, latency_ms: res.latencyMs, notes });
+  }
+  writeReports(results);
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

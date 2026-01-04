@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import time
+import urllib.request
+import urllib.error
+
+payload = {{PAYLOAD_JSON}}
+plan = payload.get("plan", [])
+config = payload.get("config", {})
+report_path = payload.get("report_path")
+artifacts_dir = payload.get("artifacts_dir")
+
+base_url = config.get("baseUrl") or "http://localhost:8080"
+headers = {"Accept": "application/json"}
+headers.update(config.get("headers") or {})
+retries = int(config.get("retries", 1))
+timeout = int(config.get("timeoutSeconds", 10))
+allow_delete = bool(config.get("allowDelete", False))
+db = config.get("db") or {}
+db_clis = config.get("dbClis") or {}
+
+context = {}
+
+
+def redact_headers(raw):
+    redacted = dict(raw)
+    if "Authorization" in redacted:
+        redacted["Authorization"] = "Bearer ***"
+    return redacted
+
+
+def sanitize_filename(text):
+    return "".join([c if c.isalnum() or c in "-_." else "_" for c in text])
+
+
+def request(method, url, body=None, extra_headers=None):
+    req_headers = dict(headers)
+    if extra_headers:
+        req_headers.update(extra_headers)
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        req_headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=req_headers)
+    start = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            latency_ms = int((time.time() - start) * 1000)
+            text = raw.decode("utf-8", errors="replace")
+            return resp.status, latency_ms, text, req_headers
+    except urllib.error.HTTPError as exc:
+        latency_ms = int((time.time() - start) * 1000)
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = str(exc)
+        return exc.code, latency_ms, body, req_headers
+    except Exception as exc:
+        latency_ms = int((time.time() - start) * 1000)
+        return 0, latency_ms, str(exc), req_headers
+
+
+def maybe_auth():
+    auth = config.get("auth") or {}
+    if not auth:
+        return
+    endpoint = auth.get("loginEndpoint")
+    if not endpoint:
+        return
+    payload = auth.get("payload")
+    if payload is None:
+        user = auth.get("username")
+        password = auth.get("password")
+        if user or password:
+            payload = {"username": user, "password": password}
+        else:
+            payload = {}
+    url = base_url.rstrip("/") + endpoint
+    status, latency_ms, text, req_headers = request("POST", url, payload)
+    if status and text:
+        try:
+            data = json.loads(text)
+            token_path = auth.get("tokenPath", "token")
+            token = data.get(token_path)
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+                context["auth_token"] = token
+        except Exception:
+            pass
+
+
+def run_seed():
+    seed_sql = config.get("seedSql")
+    seed_file = config.get("seedFile")
+    if not seed_sql and not seed_file:
+        return
+
+    engine = db.get("engine") or db.get("db_engine") or db.get("type") or "unknown"
+    cli = None
+    cmd = []
+    env = os.environ.copy()
+    if engine == "postgres" and db_clis.get("psql"):
+        cli = db_clis["psql"]
+        if db.get("password"):
+            env["PGPASSWORD"] = str(db.get("password"))
+        cmd = [
+            cli,
+            "-h",
+            str(db.get("host", "localhost")),
+            "-p",
+            str(db.get("port", 5432)),
+            "-U",
+            str(db.get("user", "postgres")),
+            "-d",
+            str(db.get("database", "postgres")),
+        ]
+        if seed_file:
+            cmd += ["-f", seed_file]
+        else:
+            cmd += ["-c", seed_sql]
+    elif engine == "mysql" and db_clis.get("mysql"):
+        cli = db_clis["mysql"]
+        cmd = [
+            cli,
+            "-h",
+            str(db.get("host", "localhost")),
+            "-P",
+            str(db.get("port", 3306)),
+            "-u",
+            str(db.get("user", "root")),
+            str(db.get("database", "mysql")),
+        ]
+        if db.get("password"):
+            cmd.insert(3, f"-p{db.get('password')}")
+        if seed_file:
+            cmd += ["-e", f"source {seed_file}"]
+        else:
+            cmd += ["-e", seed_sql]
+    elif engine == "sqlite" and db_clis.get("sqlite3"):
+        cli = db_clis["sqlite3"]
+        db_path = db.get("database") or db.get("path") or "db.sqlite"
+        cmd = [cli, db_path]
+        if seed_file:
+            cmd += [f".read {seed_file}"]
+        else:
+            cmd += [seed_sql]
+
+    if not cli or not cmd:
+        print("DB seed skipped: no matching DB CLI found.")
+        return
+
+    print("Running DB seed using", os.path.basename(cli))
+    subprocess.run(cmd, check=False, env=env)
+
+
+def run_inspect():
+    if not config.get("inspectDb"):
+        return
+    engine = db.get("engine") or db.get("db_engine") or db.get("type") or "unknown"
+    cli = None
+    cmd = []
+    env = os.environ.copy()
+    output_path = os.path.join(artifacts_dir, "db-inspect.txt")
+    if engine == "postgres" and db_clis.get("psql"):
+        cli = db_clis["psql"]
+        if db.get("password"):
+            env["PGPASSWORD"] = str(db.get("password"))
+        cmd = [
+            cli,
+            "-h",
+            str(db.get("host", "localhost")),
+            "-p",
+            str(db.get("port", 5432)),
+            "-U",
+            str(db.get("user", "postgres")),
+            "-d",
+            str(db.get("database", "postgres")),
+            "-c",
+            "\\dt",
+        ]
+    elif engine == "mysql" and db_clis.get("mysql"):
+        cli = db_clis["mysql"]
+        cmd = [
+            cli,
+            "-h",
+            str(db.get("host", "localhost")),
+            "-P",
+            str(db.get("port", 3306)),
+            "-u",
+            str(db.get("user", "root")),
+            str(db.get("database", "mysql")),
+            "-e",
+            "SHOW TABLES;",
+        ]
+        if db.get("password"):
+            cmd.insert(3, f"-p{db.get('password')}")
+    elif engine == "sqlite" and db_clis.get("sqlite3"):
+        cli = db_clis["sqlite3"]
+        db_path = db.get("database") or db.get("path") or "db.sqlite"
+        cmd = [cli, db_path, ".tables"]
+
+    if not cli or not cmd:
+        print("DB inspect skipped: no matching DB CLI found.")
+        return
+
+    print("Inspecting DB using", os.path.basename(cli))
+    os.makedirs(artifacts_dir, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as handle:
+        subprocess.run(cmd, check=False, env=env, stdout=handle, stderr=handle)
+
+
+def substitute_path(path):
+    if "{" in path and "}" in path:
+        for key, value in context.items():
+            path = path.replace("{" + key + "}", str(value))
+    if ":" in path:
+        for key, value in context.items():
+            path = path.replace(":" + key, str(value))
+    return path
+
+
+def capture_context(text):
+    try:
+        data = json.loads(text)
+    except Exception:
+        return
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key.lower().endswith("id") or key == "id":
+                context[key] = value
+
+
+def write_artifact(index, method, path, status, latency_ms, req_headers, body):
+    os.makedirs(artifacts_dir, exist_ok=True)
+    filename = sanitize_filename(f"{index:02d}_{method}_{path.strip('/')}" or "root")
+    artifact_path = os.path.join(artifacts_dir, filename + ".json")
+    with open(artifact_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "method": method,
+                "path": path,
+                "status": status,
+                "latency_ms": latency_ms,
+                "request_headers": redact_headers(req_headers),
+                "response": body,
+            },
+            handle,
+            indent=2,
+        )
+
+
+def write_reports(results):
+    md_lines = [
+        "# API Test Report",
+        "",
+        "| Method | Path | Status | Latency (ms) | Notes |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for item in results:
+        md_lines.append(
+            f"| {item['method']} | {item['path']} | {item['status']} | {item['latency_ms']} | {item['notes']} |"
+        )
+    os.makedirs(os.path.dirname(report_path), exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(md_lines) + "\n")
+
+    json_path = report_path.replace(".md", ".json")
+    with open(json_path, "w", encoding="utf-8") as handle:
+        json.dump({"results": results}, handle, indent=2)
+
+
+def main():
+    results = []
+    run_seed()
+    run_inspect()
+    maybe_auth()
+
+    for idx, ep in enumerate(plan, 1):
+        method = ep.get("method", "GET")
+        if method == "DELETE" and not allow_delete:
+            continue
+        raw_path = ep.get("path", "/")
+        path = substitute_path(raw_path)
+        url = base_url.rstrip("/") + path
+        payload = ep.get("payload") if method in {"POST", "PUT", "PATCH"} else None
+
+        status = 0
+        latency_ms = 0
+        body = ""
+        req_headers = {}
+        for attempt in range(retries + 1):
+            status, latency_ms, body, req_headers = request(method, url, payload)
+            if status and status < 500:
+                break
+            time.sleep(0.2)
+
+        capture_context(body)
+        notes = "ok" if status and status < 400 else "error"
+        if ep.get("payload_guess"):
+            notes += "; payload guessed"
+
+        write_artifact(idx, method, path, status, latency_ms, req_headers, body)
+        results.append(
+            {
+                "method": method,
+                "path": path,
+                "status": status,
+                "latency_ms": latency_ms,
+                "notes": notes,
+            }
+        )
+
+    write_reports(results)
+
+
+if __name__ == "__main__":
+    main()
