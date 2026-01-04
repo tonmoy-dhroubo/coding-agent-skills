@@ -1,9 +1,13 @@
 # Skills Repository
 
-This repo hosts multiple Codex skills under `skills/`.
+This repo hosts multiple Codex skills under `skills/`. Each skill folder contains its own `SKILL.md` and resources.
 
-Install a skill with the Codex `skill-installer` using a repo path:
+## Available Skills
 
-- `($skill-installer https://github.com/<owner>/<repo>/tree/main/skills/api-test-runner)`
+- `api-test-runner` — Discover backend APIs, generate a safe test runner, and produce reports. Path: `skills/api-test-runner`
 
-Each skill folder contains its own `SKILL.md` and resources.
+## Install (Codex)
+
+- `($skill-installer https://github.com/tonmoy-dhroubo/coding-agent-skills/tree/main/skills/api-test-runner)`
+
+After installing, restart Codex to pick up new skills.
